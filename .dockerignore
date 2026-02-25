@@ -1,0 +1,43 @@
+# Git
+.git
+.gitignore
+
+# Python cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.egg-info
+dist/
+build/
+
+# Virtual environments
+.venv
+venv
+env
+
+# Playwright browser cache & session storage (large! installed inside container)
+.playwright_storage
+playwright-report/
+test-results/
+
+# Logs (mounted as volume)
+logs/
+
+# Test artifacts
+.pytest_cache
+htmlcov/
+.coverage
+
+# Editor / OS
+.vscode
+.idea
+*.DS_Store
+Thumbs.db
+
+# Docker itself
+docker-compose.override.yml
+
+# Secrets (never send to daemon)
+.env

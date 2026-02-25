@@ -1,0 +1,31 @@
+{
+  "name": "John",
+  "home_suburb": "Parramatta",
+  "home_lat": -33.8136,
+  "home_lng": 151.0034,
+  "radius_km": 15,
+  "skills": [
+    "carpentry",
+    "decking",
+    "fencing",
+    "framing",
+    "timber",
+    "pergola",
+    "flooring",
+    "cabinet",
+    "furniture assembly"
+  ],
+  "excluded_skills": [
+    "painting",
+    "plumbing",
+    "electrical",
+    "cleaning",
+    "gardening",
+    "moving"
+  ],
+  "min_hourly_rate": 100,
+  "default_bid_price": 150,
+  "bid_template": "Hi! I'm a local carpenter based in {suburb} — I can be at your place tomorrow morning. I've completed 50+ similar jobs and have excellent reviews. Happy to provide a detailed quote on the spot.",
+  "max_concurrent_bids": 3,
+  "max_daily_bids": 20
+}

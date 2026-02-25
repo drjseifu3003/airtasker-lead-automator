@@ -1,0 +1,424 @@
+"""
+agent/session.py — Playwright session manager for Airtasker.
+
+Responsibilities:
+- Launch a stealth browser with proxy support.
+- Login to Airtasker and persist session state to disk.
+  Airtasker uses a TWO-STEP login: email first → Continue → password.
+- Auto-detect session expiry and re-login.
+- Route CAPTCHA challenges to 2Captcha for resolution.
+- Save a screenshot on any login failure for debugging.
+"""
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+import re
+
+from loguru import logger
+from playwright.async_api import (
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    Playwright,
+)
+
+from config.settings import settings
+from stealth.browser import make_browser_context
+from stealth.captcha import solve_captcha_if_present
+
+SESSION_DIR = Path(".playwright_storage")
+SESSION_FILE = SESSION_DIR / "airtasker_session.json"
+SCREENSHOT_DIR = Path("logs")
+
+LOGIN_URL = "https://www.airtasker.com/login/"
+CHECK_URL = "https://www.airtasker.com/dashboard/"
+
+# Airtasker uses various selectors depending on A/B test variant
+EMAIL_SELECTORS = [
+    "input[name='email']",
+    "input[name='username']",
+    "input[type='email']",
+    "input[placeholder*='email' i]",
+    "input[autocomplete='email']",
+]
+PASSWORD_SELECTORS = [
+    "input[name='password']",
+    "input[type='password']",
+    "input[id*='password' i]",
+    "input[name*='password' i]",
+    "input[placeholder*='password' i]",
+    "input[autocomplete='current-password']",
+    "input[autocomplete='password']",
+    "input[aria-label*='password' i]",
+]
+SUBMIT_SELECTORS = [
+    "button[type='submit']",
+    "button:has-text('Log in')",
+    "button:has-text('Sign in')",
+    "button:has-text('Continue')",
+    "button:has-text('Next')",
+    "[role='button']:has-text('Continue')",
+    "[data-testid='login-submit']",
+]
+PASSWORD_TOGGLE_SELECTORS = [
+    "button:has-text('Use password')",
+    "button:has-text('Use your password')",
+    "button:has-text('Password instead')",
+    "a:has-text('Use password')",
+]
+LOGGED_IN_SELECTORS = [
+    "[data-testid='user-avatar']",
+    "[data-testid='nav-profile']",
+    "[aria-label='Profile menu']",
+    "a[href='/dashboard/']",
+    "a[href*='my-tasks']",
+]
+
+
+class SessionManager:
+    """Manages a persistent, authenticated Playwright browser context."""
+
+    def __init__(self) -> None:
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+        self._context: BrowserContext | None = None
+        self._page: Page | None = None
+        SESSION_DIR.mkdir(exist_ok=True)
+        SCREENSHOT_DIR.mkdir(exist_ok=True)
+
+    async def start(self) -> Page:
+        """Start the browser and return a ready, authenticated page."""
+        self._playwright = await async_playwright().start()
+        self._browser, self._context = await make_browser_context(
+            self._playwright,
+            storage_state=str(SESSION_FILE) if SESSION_FILE.exists() else None,
+        )
+        self._page = await self._context.new_page()
+
+        if not await self._is_logged_in():
+            logger.info("[SESSION] Not logged in — authenticating…")
+            await self._login()
+        else:
+            logger.info("[SESSION] Existing session valid ✓")
+
+        return self._page
+
+    async def get_page(self) -> Page:
+        """Return the active page, re-authenticating if needed."""
+        if self._page is None:
+            return await self.start()
+        if not await self._is_logged_in():
+            logger.warning("[SESSION] Session expired — re-logging in…")
+            await self._login()
+        return self._page
+
+    async def new_tab(self) -> Page:
+        """Open a fresh tab in the existing context (for bidding)."""
+        return await self._context.new_page()
+
+    async def close(self) -> None:
+        if self._context:
+            await self._context.close()
+        if self._browser:
+            await self._browser.close()
+        if self._playwright:
+            await self._playwright.stop()
+        logger.info("[SESSION] Browser closed.")
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    async def _screenshot(self, name: str) -> None:
+        """Save a debug screenshot to logs/ for post-mortem analysis."""
+        try:
+            path = SCREENSHOT_DIR / f"{name}.png"
+            await self._page.screenshot(path=str(path), full_page=True)
+            logger.info(f"[SESSION] Screenshot saved → {path}")
+        except Exception as exc:
+            logger.warning(f"[SESSION] Could not save screenshot: {exc}")
+
+    async def _is_login_error_page(self) -> bool:
+        """Detect Airtasker's generic login error page (no form present)."""
+        try:
+            text = await self._page.inner_text("body", timeout=2_000)
+        except Exception:
+            return False
+
+        lowered = text.lower()
+        return (
+            "sorry, something went wrong" in lowered
+            or "an error occurred while logging you in" in lowered
+        )
+
+    async def _find_selector(self, selectors: list[str], timeout: int = 8_000) -> str | None:
+        """Return the first selector whose element becomes visible before timeout."""
+        deadline = asyncio.get_running_loop().time() + timeout / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            for sel in selectors:
+                try:
+                    locator = self._page.locator(sel).first
+                    if await locator.is_visible(timeout=250):
+                        logger.debug(f"[SESSION] Found selector: {sel}")
+                        return sel
+                except Exception:
+                    continue
+            await asyncio.sleep(0.2)
+        return None
+
+    async def _click_first_visible(
+        self,
+        selectors: list[str],
+        timeout: int = 5_000,
+    ) -> str | None:
+        """Click the first visible selector and return it."""
+        sel = await self._find_selector(selectors, timeout=timeout)
+        if not sel:
+            return None
+        locator = self._page.locator(sel).first
+        try:
+            await locator.click(delay=80, timeout=2_500)
+            return sel
+        except Exception:
+            try:
+                await locator.click(force=True, timeout=2_500)
+                return sel
+            except Exception as exc:
+                logger.warning(f"[SESSION] Click failed for selector {sel}: {exc}")
+                return None
+
+    async def _click_primary_continue(self, timeout: int = 8_000) -> bool:
+        """Click the primary Airtasker Continue button (not social buttons)."""
+        deadline = asyncio.get_running_loop().time() + timeout / 1000
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                button = self._page.locator("button").filter(has_text=re.compile(r"^Continue$", re.I)).first
+                if await button.is_visible(timeout=250) and await button.is_enabled():
+                    try:
+                        await button.click(delay=80, timeout=2_500)
+                        return True
+                    except Exception:
+                        await button.click(force=True, timeout=2_500)
+                        return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.2)
+        return False
+
+    async def _safe_click_selector(self, selector: str, timeout: int = 4_000) -> bool:
+        """Attempt normal click then force-click for a selector, returning success."""
+        locator = self._page.locator(selector).first
+        try:
+            await locator.click(delay=80, timeout=timeout)
+            return True
+        except Exception:
+            try:
+                await locator.click(force=True, timeout=timeout)
+                return True
+            except Exception as exc:
+                logger.warning(f"[SESSION] Submit click failed for {selector}: {exc}")
+                return False
+
+    async def _submit_identifier_step(self) -> bool:
+        """Submit the identifier (email) step using multiple non-skipping strategies."""
+        try:
+            clicked = await self._click_primary_continue(timeout=3_000)
+            if clicked:
+                return True
+        except Exception:
+            pass
+
+        email_sel = await self._find_selector(EMAIL_SELECTORS, timeout=2_000)
+        if email_sel:
+            try:
+                await self._page.locator(email_sel).first.press("Enter", timeout=2_000)
+                return True
+            except Exception:
+                pass
+
+        try:
+            await self._page.evaluate(
+                """() => {
+                    const form = document.querySelector('form');
+                    if (!form) return false;
+                    form.requestSubmit();
+                    return true;
+                }"""
+            )
+            return True
+        except Exception:
+            return False
+
+    async def _ensure_password_step(self, timeout: int = 15_000) -> str | None:
+        """Ensure we are on the password step and return a matching password selector."""
+        password_sel = await self._find_selector(PASSWORD_SELECTORS, timeout=4_000)
+        if password_sel:
+            return password_sel
+
+        try:
+            await self._page.wait_for_url("**/u/login/password**", timeout=timeout)
+        except Exception:
+            pass
+
+        password_sel = await self._find_selector(PASSWORD_SELECTORS, timeout=4_000)
+        if password_sel:
+            return password_sel
+
+        current_url = self._page.url
+        if "/u/login/identifier" in current_url:
+            logger.warning("[SESSION] Stuck on identifier step — re-submitting identifier form")
+            submitted = await self._submit_identifier_step()
+            if submitted:
+                try:
+                    await self._page.wait_for_url("**/u/login/password**", timeout=max(4_000, timeout))
+                except Exception:
+                    pass
+
+        return await self._find_selector(PASSWORD_SELECTORS, timeout=6_000)
+
+    async def _is_logged_in(self) -> bool:
+        try:
+            await self._page.goto(CHECK_URL, wait_until="domcontentloaded", timeout=20_000)
+            await asyncio.sleep(2)
+            sel = await self._find_selector(LOGGED_IN_SELECTORS, timeout=5_000)
+            return sel is not None
+        except Exception:
+            return False
+
+    async def _login(self) -> None:
+        from stealth.behavior import human_type, random_sleep
+
+        page = self._page
+        logger.info(f"[SESSION] Navigating to {LOGIN_URL}")
+        await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
+        await random_sleep(2, 3)
+
+        # Handle any CAPTCHA before interacting
+        await solve_captcha_if_present(page)
+        await random_sleep(1, 2)
+
+        await self._screenshot("login_01_page_loaded")
+
+        # ── Step 1: Enter email ────────────────────────────────────────────────
+        email_sel = await self._find_selector(EMAIL_SELECTORS, timeout=15_000)
+        if not email_sel:
+            await self._screenshot("login_error_no_email_field")
+            raise RuntimeError(
+                "[SESSION] Could not find email input on Airtasker login page. "
+                "Check logs/login_error_no_email_field.png for a screenshot."
+            )
+
+        logger.info(f"[SESSION] Typing email into: {email_sel}")
+        await human_type(page, email_sel, settings.airtasker_email)
+        await random_sleep(0.5, 1.0)
+
+        # Airtasker does a server-side email check ("Verifying...") before
+        # revealing the password field. Wait for that spinner to resolve.
+        logger.info("[SESSION] Waiting for Airtasker email verification to complete…")
+        try:
+            # Wait until the "Verifying..." placeholder text disappears
+            await page.wait_for_function(
+                "!document.body.innerText.includes('Verifying')",
+                timeout=15_000,
+            )
+        except Exception:
+            pass  # Spinner may not appear for all accounts — continue anyway
+        await random_sleep(0.5, 1.0)
+
+        # The blue "Continue" button is always visible on this page.
+        # Clicking it triggers the password field to appear.
+        clicked_primary_continue = await self._click_primary_continue(timeout=8_000)
+        if clicked_primary_continue:
+            logger.info("[SESSION] Clicking primary Continue button")
+            await random_sleep(2, 3)
+        else:
+            continue_sel = await self._click_first_visible(SUBMIT_SELECTORS, timeout=5_000)
+            if continue_sel:
+                logger.info(f"[SESSION] Clicking fallback submit button: {continue_sel}")
+                await random_sleep(2, 3)
+            else:
+                logger.info("[SESSION] No Continue button found — pressing Enter")
+                await page.keyboard.press("Enter")
+                await random_sleep(2, 3)
+
+        await solve_captcha_if_present(page)
+        await self._screenshot("login_02_after_continue")
+
+        # Some runs stay on the email step after first click; try one more transition.
+        password_sel = await self._ensure_password_step(timeout=10_000)
+        if not password_sel:
+            logger.warning("[SESSION] Password field not visible after first continue — retrying once")
+            retried_continue = await self._click_primary_continue(timeout=4_000)
+            if retried_continue:
+                await random_sleep(1.5, 2.5)
+
+        await solve_captcha_if_present(page)
+
+        password_toggle_sel = await self._click_first_visible(PASSWORD_TOGGLE_SELECTORS, timeout=3_000)
+        if password_toggle_sel:
+            logger.info(f"[SESSION] Opened password login via: {password_toggle_sel}")
+            await random_sleep(2, 3)
+            await random_sleep(1, 2)
+
+        # ── Step 2: Enter password ─────────────────────────────────────────────
+        password_sel = password_sel or await self._ensure_password_step(timeout=15_000)
+        if not password_sel:
+            await self._screenshot("login_error_no_password_field")
+            is_error_page = await self._is_login_error_page()
+            if is_error_page:
+                logger.error(
+                    "[SESSION] Airtasker returned a login error page instead of a password form. "
+                    "This usually indicates invalid credentials, a locked account, or a temporary site issue."
+                )
+                raise RuntimeError(
+                    "[SESSION] Airtasker showed a login error page while trying to reach the password step. "
+                    "Verify that you can log in manually in a normal browser with the same credentials, "
+                    "and check logs/login_error_no_password_field.png."
+                )
+
+            logger.error(f"[SESSION] Password field not found. Current URL: {page.url}")
+            raise RuntimeError(
+                "[SESSION] Could not find password input. "
+                "Check logs/login_error_no_password_field.png"
+            )
+
+        logger.info(f"[SESSION] Typing password into: {password_sel}")
+        await human_type(page, password_sel, settings.airtasker_password)
+        await random_sleep(0.5, 1.2)
+
+        # ── Step 3: Submit ─────────────────────────────────────────────────────
+        submit_sel = await self._find_selector(SUBMIT_SELECTORS, timeout=5_000)
+        if submit_sel:
+            logger.info(f"[SESSION] Submitting via: {submit_sel}")
+            clicked = await self._safe_click_selector(submit_sel, timeout=4_000)
+            if not clicked:
+                await page.keyboard.press("Enter")
+        else:
+            # Fallback: press Enter
+            await page.keyboard.press("Enter")
+
+        await random_sleep(3, 5)
+        await solve_captcha_if_present(page)
+        await self._screenshot("login_03_post_submit")
+
+        # ── Confirm login ──────────────────────────────────────────────────────
+        logged_in_sel = await self._find_selector(LOGGED_IN_SELECTORS, timeout=20_000)
+        if not logged_in_sel:
+            await self._screenshot("login_error_failed")
+            current_url = page.url
+            logger.error(f"[SESSION] Login failed. Current URL: {current_url}")
+            raise RuntimeError(
+                "[SESSION] Airtasker login failed — check credentials, CAPTCHA, or "
+                "inspect logs/login_error_failed.png"
+            )
+
+        logger.info("[SESSION] Login successful ✓")
+
+        # Persist session to disk
+        await self._context.storage_state(path=str(SESSION_FILE))
+        logger.info(f"[SESSION] Session saved to {SESSION_FILE}")
+        await random_sleep(1, 2)
+
+
+# Singleton
+session = SessionManager()

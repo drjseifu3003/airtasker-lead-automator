@@ -1,0 +1,34 @@
+version: "3.9"
+
+services:
+  agent:
+    build: .
+    container_name: ai-lead-agent
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./logs:/app/logs
+      - ./playwright_storage:/app/.playwright_storage
+      - ./config/profiles:/app/config/profiles
+    depends_on:
+      - redis
+    networks:
+      - agent-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: ai-lead-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    networks:
+      - agent-net
+
+networks:
+  agent-net:
+    driver: bridge
+
+volumes:
+  redis-data:
