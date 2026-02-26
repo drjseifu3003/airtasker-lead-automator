@@ -19,16 +19,16 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── OpenAI / LLM (supports OpenAI, Groq, OpenRouter, etc.) ─────────────────
+    # ── OpenAI / LLM ──────────────────────────────────────────────────────────
     openai_api_key: str = Field(..., description="API key for the LLM provider")
-    openai_model: str = Field("gpt-4o-mini", description="Model name (e.g. llama-3.1-8b-instant for Groq)")
+    openai_model: str = Field("gpt-4o-mini", description="Model name")
     openai_base_url: str = Field("", description="Optional: override base URL for Groq/OpenRouter")
 
     # ── Airtasker ─────────────────────────────────────────────────────────────
     airtasker_email: str = Field(..., description="Airtasker login email")
     airtasker_password: str = Field(..., description="Airtasker login password")
 
-    # ── Telegram ─────────────────────────────────────────────────────────────
+    # ── Telegram ──────────────────────────────────────────────────────────────
     telegram_bot_token: str = Field(..., description="Telegram bot token from @BotFather")
     telegram_chat_id: str = Field(..., description="Telegram chat ID to send alerts to")
 
@@ -36,10 +36,14 @@ class Settings(BaseSettings):
     twocaptcha_api_key: str = Field("", description="2Captcha API key")
 
     # ── Proxy ─────────────────────────────────────────────────────────────────
-    proxy_host: str = Field("", description="Residential proxy host")
-    proxy_port: int = Field(8080, description="Residential proxy port")
+    # Use empty string defaults so we can detect "not configured"
+    proxy_host: str = Field("", description="Proxy host (leave empty to disable)")
+    proxy_port: int = Field(1081, description="Proxy port")
     proxy_username: str = Field("", description="Proxy username")
     proxy_password: str = Field("", description="Proxy password")
+    # Proxy protocol: use 'socks5' for proxybase.org and most residential proxies
+    # Use 'http' only for HTTP CONNECT proxies
+    proxy_protocol: str = Field("socks5", description="Proxy protocol: socks5 or http")
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
     dashboard_port: int = Field(8000, description="Dashboard HTTP port")
@@ -54,21 +58,22 @@ class Settings(BaseSettings):
 
     @property
     def proxy_server(self) -> str | None:
-        """Return formatted proxy server string for Playwright, or None if not set."""
-        if self.proxy_host:
-            return f"http://{self.proxy_host}:{self.proxy_port}"
-        return None
+        """Return formatted proxy URL for Playwright, or None if not configured."""
+        if not self.proxy_host:
+            return None
+        return f"{self.proxy_protocol}://{self.proxy_username}:{self.proxy_password}@{self.proxy_host}:{self.proxy_port}"
 
     @property
     def proxy_config(self) -> dict | None:
         """Return Playwright proxy config dict, or None if proxy not configured."""
-        if not self.proxy_host:
+        server = self.proxy_server
+        if not server:
             return None
-        cfg = {"server": self.proxy_server}
-        if self.proxy_username:
-            cfg["username"] = self.proxy_username
-            cfg["password"] = self.proxy_password
-        return cfg
+        return {
+            "server": server,
+            "username": self.proxy_username,
+            "password": self.proxy_password,
+        }
 
 
 def load_profile(profile_path: str = "config/profiles/default.json") -> dict:

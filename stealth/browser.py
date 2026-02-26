@@ -5,7 +5,7 @@ Launches a Chromium instance with:
 - playwright-stealth patches (spoofs navigator, plugins, WebGL, etc.)
 - Randomised User-Agent, viewport, locale, timezone
 - Optional residential proxy
-- Canvas/WebGL fingerprint noise injection
+- Comprehensive fingerprint spoofing to pass Cloudflare Turnstile
 """
 from __future__ import annotations
 
@@ -18,12 +18,13 @@ from playwright_stealth import stealth_async
 
 from config.settings import settings
 
-# Pool of realistic User-Agents
+# Pool of realistic User-Agents (Chrome 122-124 range, common platforms)
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
 _VIEWPORTS = [
@@ -39,31 +40,167 @@ _TIMEZONES = [
     "Australia/Brisbane",
 ]
 
-# Minimal JS to add noise to Canvas and WebGL fingerprints
-_FINGERPRINT_NOISE_SCRIPT = """
-(function() {
-    const noise = () => Math.random() * 0.001;
+# Comprehensive stealth script that defeats Cloudflare Turnstile bot detection.
+# Patches the most common automation fingerprints that CF checks:
+#   - navigator.webdriver (most critical)
+#   - chrome runtime object
+#   - plugins / mimeTypes (empty in headless)
+#   - permissions API
+#   - navigator.languages
+#   - WebGL vendor/renderer
+#   - Canvas fingerprint noise
+#   - window.outerWidth/Height
+#   - navigator.hardwareConcurrency / deviceMemory
+_STEALTH_INIT_SCRIPT = """
+(function () {
+    'use strict';
 
-    // Canvas noise
-    const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-    CanvasRenderingContext2D.prototype.getImageData = function(...args) {
-        const data = origGetImageData.apply(this, args);
-        for (let i = 0; i < data.data.length; i += 4) {
-            data.data[i]   = Math.min(255, data.data[i]   + Math.round(noise() * 10));
-            data.data[i+1] = Math.min(255, data.data[i+1] + Math.round(noise() * 10));
-            data.data[i+2] = Math.min(255, data.data[i+2] + Math.round(noise() * 10));
+    // ── 1. Remove navigator.webdriver ────────────────────────────────────────
+    Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+    });
+
+    // ── 2. Restore chrome runtime (missing in headless) ──────────────────────
+    if (!window.chrome) {
+        window.chrome = {
+            app: { isInstalled: false, InstallState: {}, RunningState: {} },
+            runtime: {
+                OnInstalledReason: {},
+                OnRestartRequiredReason: {},
+                PlatformArch: {},
+                PlatformNaclArch: {},
+                PlatformOs: {},
+                RequestUpdateCheckStatus: {},
+                connect: function() {},
+                sendMessage: function() {},
+            },
+            loadTimes: function() {},
+            csi: function() {},
+        };
+    }
+
+    // ── 3. Spoof plugins (headless has none) ─────────────────────────────────
+    const makePlugin = (name, desc, filename, mimeTypes) => {
+        const plugin = Object.create(Plugin.prototype);
+        Object.defineProperties(plugin, {
+            name:        { value: name, enumerable: true },
+            description: { value: desc, enumerable: true },
+            filename:    { value: filename, enumerable: true },
+            length:      { value: mimeTypes.length, enumerable: true },
+        });
+        mimeTypes.forEach((mt, i) => {
+            const mime = Object.create(MimeType.prototype);
+            Object.defineProperties(mime, {
+                type:        { value: mt.type, enumerable: true },
+                description: { value: mt.description, enumerable: true },
+                suffixes:    { value: mt.suffixes, enumerable: true },
+                enabledPlugin: { value: plugin, enumerable: true },
+            });
+            plugin[i] = mime;
+            plugin[mt.type] = mime;
+        });
+        return plugin;
+    };
+
+    const pdfPlugin = makePlugin(
+        'PDF Viewer', 'Portable Document Format',
+        'internal-pdf-viewer',
+        [{ type: 'application/pdf', description: 'Portable Document Format', suffixes: 'pdf' }]
+    );
+    const chromePdf = makePlugin(
+        'Chrome PDF Viewer', 'Portable Document Format',
+        'internal-pdf-viewer',
+        [{ type: 'application/pdf', description: 'Portable Document Format', suffixes: 'pdf' }]
+    );
+    const nativePdf = makePlugin(
+        'Chromium PDF Plugin', 'Portable Document Format',
+        'internal-pdf-viewer',
+        [{ type: 'application/x-google-chrome-pdf', description: 'Portable Document Format', suffixes: 'pdf' }]
+    );
+
+    const pluginArray = Object.create(PluginArray.prototype);
+    [pdfPlugin, chromePdf, nativePdf].forEach((p, i) => {
+        pluginArray[i] = p;
+        pluginArray[p.name] = p;
+    });
+    Object.defineProperty(pluginArray, 'length', { value: 3 });
+    Object.defineProperty(navigator, 'plugins', {
+        get: () => pluginArray,
+        configurable: true,
+    });
+
+    // ── 4. Permissions API — don't reveal automation ─────────────────────────
+    const origQuery = window.navigator.permissions && window.navigator.permissions.query;
+    if (origQuery) {
+        window.navigator.permissions.query = (parameters) => (
+            parameters.name === 'notifications'
+                ? Promise.resolve({ state: Notification.permission })
+                : origQuery(parameters)
+        );
+    }
+
+    // ── 5. Languages ─────────────────────────────────────────────────────────
+    Object.defineProperty(navigator, 'languages', {
+        get: () => ['en-AU', 'en-GB', 'en'],
+        configurable: true,
+    });
+
+    // ── 6. Hardware signals ──────────────────────────────────────────────────
+    Object.defineProperty(navigator, 'hardwareConcurrency', {
+        get: () => 8,
+        configurable: true,
+    });
+    Object.defineProperty(navigator, 'deviceMemory', {
+        get: () => 8,
+        configurable: true,
+    });
+
+    // ── 7. Window size (headless has no outer size) ──────────────────────────
+    if (window.outerWidth === 0) {
+        Object.defineProperty(window, 'outerWidth',  { get: () => window.innerWidth,  configurable: true });
+        Object.defineProperty(window, 'outerHeight', { get: () => window.innerHeight + 85, configurable: true });
+    }
+
+    // ── 8. WebGL vendor/renderer ─────────────────────────────────────────────
+    const getCtx = HTMLCanvasElement.prototype.getContext;
+    HTMLCanvasElement.prototype.getContext = function(type, ...args) {
+        const ctx = getCtx.call(this, type, ...args);
+        if (!ctx) return ctx;
+        if (type === 'webgl' || type === 'webgl2' || type === 'experimental-webgl') {
+            const getParam = ctx.getParameter.bind(ctx);
+            ctx.getParameter = function(param) {
+                if (param === 37445) return 'Google Inc. (Intel)';     // UNMASKED_VENDOR_WEBGL
+                if (param === 37446) return 'ANGLE (Intel, Intel(R) UHD Graphics 620 Direct3D11 vs_5_0 ps_5_0, D3D11)'; // UNMASKED_RENDERER_WEBGL
+                return getParam(param);
+            };
         }
-        return data;
+        return ctx;
     };
 
-    // WebGL noise on getParameter
-    const origGetParam = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(param) {
-        const val = origGetParam.call(this, param);
-        if (param === 37445) return 'Intel Inc.';   // VENDOR
-        if (param === 37446) return 'Intel Iris OpenGL Engine';  // RENDERER
-        return val;
+    // ── 9. Canvas fingerprint noise ──────────────────────────────────────────
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    HTMLCanvasElement.prototype.toDataURL = function(type, ...args) {
+        if (this.width > 16 && this.height > 16) {
+            const ctx2d = getCtx.call(this, '2d');
+            if (ctx2d) {
+                const imageData = ctx2d.getImageData(0, 0, 1, 1);
+                imageData.data[0] = imageData.data[0] ^ 1;
+                ctx2d.putImageData(imageData, 0, 0);
+            }
+        }
+        return origToDataURL.apply(this, [type, ...args]);
     };
+
+    // ── 10. iframe contentWindow access ─────────────────────────────────────
+    // Some detectors check if iframes have same-origin restrictions
+    // This is a no-op but signals normal browser behaviour
+    Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+        get: function() {
+            return this.contentWindow;
+        },
+    });
+
 })();
 """
 
@@ -81,7 +218,9 @@ async def make_browser_context(
     timezone = random.choice(_TIMEZONES)
     locale = "en-AU"
 
-    logger.debug(f"[BROWSER] UA={ua[:40]}... viewport={viewport} tz={timezone}")
+    logger.debug(
+        f"[BROWSER] UA={ua[:40]}... viewport={viewport} tz={timezone}"
+    )
 
     launch_kwargs: dict = {
         "headless": True,
@@ -89,10 +228,27 @@ async def make_browser_context(
             "--no-sandbox",
             "--disable-setuid-sandbox",
             "--disable-dev-shm-usage",
+            # Critical: remove automation flags that Cloudflare detects
             "--disable-blink-features=AutomationControlled",
+            "--disable-automation",
+            # Performance / stability
             "--disable-extensions",
             "--no-first-run",
             "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-client-side-phishing-detection",
+            "--disable-default-apps",
+            "--disable-hang-monitor",
+            "--disable-popup-blocking",
+            "--disable-prompt-on-repost",
+            "--disable-sync",
+            "--metrics-recording-only",
+            "--safebrowsing-disable-auto-update",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            # Make headless look more like a real browser
+            "--window-size=1440,900",
+            "--start-maximized",
         ],
     }
 
@@ -112,9 +268,13 @@ async def make_browser_context(
         "timezone_id": timezone,
         "java_script_enabled": True,
         "bypass_csp": True,
+        "ignore_https_errors": True,  # BrightData uses custom SSL cert
         "extra_http_headers": {
-            "Accept-Language": "en-AU,en;q=0.9",
+            "Accept-Language": "en-AU,en-GB;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
+            "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": '"Windows"',
         },
     }
 
@@ -124,16 +284,16 @@ async def make_browser_context(
 
     context = await browser.new_context(**context_kwargs)
 
-    # Inject fingerprint noise into every page
-    await context.add_init_script(_FINGERPRINT_NOISE_SCRIPT)
+    # Inject stealth patches into every new page BEFORE any page scripts run
+    await context.add_init_script(_STEALTH_INIT_SCRIPT)
 
-    # Apply playwright-stealth to every new page
-    context.on("page", lambda page: _apply_stealth(page))  # type: ignore
+    # Apply playwright-stealth on top (covers additional vectors)
+    context.on("page", lambda page: _apply_stealth(page))
 
     return browser, context
 
 
 def _apply_stealth(page) -> None:
-    """Schedule stealth patches on a newly opened page."""
+    """Schedule playwright-stealth patches on a newly opened page."""
     import asyncio
     asyncio.ensure_future(stealth_async(page))

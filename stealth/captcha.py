@@ -1,9 +1,13 @@
 """
-stealth/captcha.py — 2Captcha solver integration for Playwright pages.
+stealth/captcha.py
 
-Detects Cloudflare Turnstile, hCaptcha, and reCAPTCHA v2/v3 on the
-current page, solves them via the 2Captcha API, and injects the
-solution token so the form can proceed normally.
+KEY INSIGHT: 2Captcha tokens are bound to 2Captcha's browser fingerprint.
+Auth0 + Cloudflare verify that the token came from the SAME browser/IP that
+is submitting the form. Injecting a foreign token ALWAYS fails silently.
+
+Correct approach: wait for Turnstile to auto-solve in OUR browser.
+Turnstile 'flexible' mode often passes automatically when the browser
+looks sufficiently human. We just need to wait for it.
 """
 from __future__ import annotations
 
@@ -11,166 +15,100 @@ import asyncio
 
 from loguru import logger
 from playwright.async_api import Page
-from twocaptcha import TwoCaptcha
-
-from config.settings import settings
-
-_solver: TwoCaptcha | None = None
-
-
-def _get_solver() -> TwoCaptcha:
-    global _solver
-    if _solver is None:
-        if not settings.twocaptcha_api_key:
-            raise RuntimeError("TWOCAPTCHA_API_KEY is not configured")
-        _solver = TwoCaptcha(settings.twocaptcha_api_key)
-    return _solver
 
 
 async def solve_captcha_if_present(page: Page) -> bool:
     """
-    Detect and solve any CAPTCHA on the page.
-    Returns True if a CAPTCHA was detected and solved, False otherwise.
-    Safe to call at any point — it waits for page stability first and
-    silently returns False if the page navigates mid-check.
+    Wait for Cloudflare Turnstile to auto-solve in the current browser.
+    Returns True if solved or no captcha present, False if timed out.
     """
     try:
-        # Wait for any pending navigation to settle before querying the DOM
         await page.wait_for_load_state("domcontentloaded", timeout=10_000)
-        await asyncio.sleep(1.5)  # let anti-bot JS initialise
+        await asyncio.sleep(1.0)
     except Exception:
-        # Page may already be stable or navigating — continue anyway
-        await asyncio.sleep(1)
+        pass
 
-    # ── Cloudflare Turnstile ──────────────────────────────────────────────────
-    try:
-        turnstile_el = await page.query_selector("iframe[src*='challenges.cloudflare.com']")
-        if turnstile_el:
-            logger.info("[CAPTCHA] Cloudflare Turnstile detected — solving via 2Captcha…")
-            site_key = await _extract_turnstile_sitekey(page)
-            if site_key:
-                return await _solve_turnstile(page, site_key)
-    except Exception as exc:
-        logger.debug(f"[CAPTCHA] Turnstile check skipped (navigation?): {exc}")
+    # Check if Turnstile iframe is present
+    if not any("challenges.cloudflare.com" in f.url for f in page.frames):
+        return True  # No captcha
 
-    # ── hCaptcha ──────────────────────────────────────────────────────────────
-    try:
-        hcaptcha_el = await page.query_selector("iframe[src*='hcaptcha.com']")
-        if hcaptcha_el:
-            logger.info("[CAPTCHA] hCaptcha detected — solving via 2Captcha…")
-            site_key = await _extract_hcaptcha_sitekey(page)
-            if site_key:
-                return await _solve_hcaptcha(page, site_key)
-    except Exception as exc:
-        logger.debug(f"[CAPTCHA] hCaptcha check skipped (navigation?): {exc}")
+    logger.info("[CAPTCHA] Turnstile detected — waiting for browser auto-solve…")
 
-    # ── reCAPTCHA v2 ─────────────────────────────────────────────────────────
-    try:
-        recaptcha_el = await page.query_selector(".g-recaptcha, iframe[src*='recaptcha']")
-        if recaptcha_el:
-            logger.info("[CAPTCHA] reCAPTCHA v2 detected — solving via 2Captcha…")
-            site_key = await _extract_recaptcha_sitekey(page)
-            if site_key:
-                return await _solve_recaptcha(page, site_key)
-    except Exception as exc:
-        logger.debug(f"[CAPTCHA] reCAPTCHA check skipped (navigation?): {exc}")
+    # Wait up to 30s for auto-solve
+    if await _wait_for_token(page, timeout_secs=30):
+        logger.info("[CAPTCHA] Turnstile auto-solved ✓")
+        return True
 
+    # Try clicking the checkbox manually then wait again
+    logger.info("[CAPTCHA] Not auto-solved — trying checkbox click…")
+    await _click_checkbox(page)
+    if await _wait_for_token(page, timeout_secs=15):
+        logger.info("[CAPTCHA] Turnstile solved after click ✓")
+        return True
+
+    logger.warning("[CAPTCHA] Turnstile unsolved — browser likely flagged as bot. "
+                   "Consider adding a residential proxy.")
     return False
 
 
-# ── Solvers ───────────────────────────────────────────────────────────────────
+async def _wait_for_token(page: Page, timeout_secs: int) -> bool:
+    """Poll until cf-turnstile-response has a value or iframe shows success."""
+    for _ in range(timeout_secs * 2):
+        await asyncio.sleep(0.5)
+        try:
+            token = await page.evaluate(
+                "() => (document.querySelector('input[name=\"cf-turnstile-response\"]') || {}).value || ''"
+            )
+            if token and len(token) > 20:
+                logger.debug(f"[CAPTCHA] Token found in DOM ({len(token)} chars)")
+                return True
+        except Exception:
+            pass
 
-async def _solve_turnstile(page: Page, site_key: str) -> bool:
-    url = page.url
+        # Also check iframe success state
+        for frame in page.frames:
+            if "challenges.cloudflare.com" not in frame.url:
+                continue
+            try:
+                done = await frame.evaluate("""() => {
+                    const cb = document.querySelector('input[type="checkbox"]');
+                    return cb ? cb.checked : false;
+                }""")
+                if done:
+                    return True
+            except Exception:
+                pass
+    return False
+
+
+async def _click_checkbox(page: Page) -> None:
+    """Click the Turnstile checkbox using absolute page coordinates."""
     try:
-        result = await asyncio.to_thread(
-            _get_solver().turnstile,
-            sitekey=site_key,
-            url=url,
-        )
-        token = result["code"]
-        await _inject_turnstile_token(page, token)
-        logger.info("[CAPTCHA] Turnstile solved ✓")
-        return True
+        for frame in page.frames:
+            if "challenges.cloudflare.com" not in frame.url:
+                continue
+            iframe_el = await frame.frame_element()
+            iframe_box = await iframe_el.bounding_box()
+            if not iframe_box:
+                continue
+            try:
+                cb = frame.locator("input[type='checkbox'], [role='checkbox']").first
+                cb_box = await cb.bounding_box(timeout=2_000)
+                if cb_box:
+                    await page.mouse.click(
+                        iframe_box["x"] + cb_box["x"] + cb_box["width"] / 2,
+                        iframe_box["y"] + cb_box["y"] + cb_box["height"] / 2,
+                    )
+                    logger.debug("[CAPTCHA] Clicked checkbox")
+                    return
+            except Exception:
+                pass
+            # Fallback: click left side of iframe where checkbox usually is
+            await page.mouse.click(
+                iframe_box["x"] + 24,
+                iframe_box["y"] + iframe_box["height"] / 2,
+            )
+            logger.debug("[CAPTCHA] Clicked iframe (fallback)")
+            return
     except Exception as exc:
-        logger.error(f"[CAPTCHA] Turnstile solve failed: {exc}")
-        return False
-
-
-async def _solve_hcaptcha(page: Page, site_key: str) -> bool:
-    url = page.url
-    try:
-        result = await asyncio.to_thread(
-            _get_solver().hcaptcha,
-            sitekey=site_key,
-            url=url,
-        )
-        token = result["code"]
-        await page.evaluate(
-            f"document.querySelector('[name=\"h-captcha-response\"]').value = '{token}';"
-        )
-        logger.info("[CAPTCHA] hCaptcha solved ✓")
-        return True
-    except Exception as exc:
-        logger.error(f"[CAPTCHA] hCaptcha solve failed: {exc}")
-        return False
-
-
-async def _solve_recaptcha(page: Page, site_key: str) -> bool:
-    url = page.url
-    try:
-        result = await asyncio.to_thread(
-            _get_solver().recaptcha,
-            sitekey=site_key,
-            url=url,
-        )
-        token = result["code"]
-        await page.evaluate(
-            f"document.getElementById('g-recaptcha-response').innerHTML = '{token}';"
-        )
-        logger.info("[CAPTCHA] reCAPTCHA solved ✓")
-        return True
-    except Exception as exc:
-        logger.error(f"[CAPTCHA] reCAPTCHA solve failed: {exc}")
-        return False
-
-
-# ── Site key extraction ───────────────────────────────────────────────────────
-
-async def _extract_turnstile_sitekey(page: Page) -> str | None:
-    return await page.evaluate("""
-        (() => {
-            const el = document.querySelector('[data-sitekey]');
-            if (el) return el.getAttribute('data-sitekey');
-            const m = document.body.innerHTML.match(/sitekey['":\\s]+([A-Za-z0-9_-]{20,})/);
-            return m ? m[1] : null;
-        })()
-    """)
-
-
-async def _extract_hcaptcha_sitekey(page: Page) -> str | None:
-    return await page.evaluate("""
-        (() => {
-            const el = document.querySelector('[data-hcaptcha-sitekey], .h-captcha[data-sitekey]');
-            return el ? el.getAttribute('data-sitekey') : null;
-        })()
-    """)
-
-
-async def _extract_recaptcha_sitekey(page: Page) -> str | None:
-    return await page.evaluate("""
-        (() => {
-            const el = document.querySelector('.g-recaptcha[data-sitekey]');
-            return el ? el.getAttribute('data-sitekey') : null;
-        })()
-    """)
-
-
-async def _inject_turnstile_token(page: Page, token: str) -> None:
-    await page.evaluate(f"""
-        (() => {{
-            const input = document.querySelector('[name="cf-turnstile-response"]');
-            if (input) input.value = '{token}';
-            if (window.turnstile) window.turnstile.reset();
-        }})()
-    """)
+        logger.debug(f"[CAPTCHA] Click failed: {exc}")
