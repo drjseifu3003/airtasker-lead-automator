@@ -1,32 +1,31 @@
-# Core automation
-playwright==1.42.0
+# Core automation (Playwright 1.48+ pulls greenlet>=3.1.1 — required for Python 3.13 / Windows wheels)
+playwright==1.59.0
 playwright-stealth==1.0.6
+# playwright-stealth 1.0.x needs pkg_resources (removed in setuptools>=82)
+setuptools>=69.0.0,<82.0.0
 
 # AI / LLM
-openai==1.14.0
+openai==1.65.0
 
-# Config & validation
-pydantic==2.6.3
-pydantic-settings==2.2.1
-python-dotenv==1.0.1
+# Config & validation (pydantic-core 2.33+ ships cp313-win_amd64 wheels)
+pydantic==2.11.4
+pydantic-settings==2.8.1
+python-dotenv==1.2.2
 
 # Telegram bot
-python-telegram-bot==21.0.1
-
-# CAPTCHA solving
-2captcha-python==2.0.3
+python-telegram-bot==21.10
 
 # Dashboard API
-fastapi==0.110.0
-uvicorn[standard]==0.28.0
-sse-starlette==1.6.5
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+sse-starlette==2.2.1
 
 # HTTP client
-aiohttp==3.9.3
-httpx==0.27.0
+aiohttp==3.11.11
+httpx==0.28.1
 
 # State / deduplication
-redis==5.0.3
+redis==5.2.1
 
 # Geo / distance
 geopy==2.4.1
@@ -35,6 +34,6 @@ geopy==2.4.1
 loguru==0.7.2
 
 # Testing
-pytest==8.1.0
-pytest-asyncio==0.23.5
-pytest-mock==3.12.0
+pytest==8.3.5
+pytest-asyncio==0.25.3
+pytest-mock==3.14.0

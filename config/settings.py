@@ -32,8 +32,9 @@ class Settings(BaseSettings):
     telegram_bot_token: str = Field(..., description="Telegram bot token from @BotFather")
     telegram_chat_id: str = Field(..., description="Telegram chat ID to send alerts to")
 
-    # ── 2Captcha ──────────────────────────────────────────────────────────────
-    twocaptcha_api_key: str = Field("", description="2Captcha API key")
+    # ── CapSolver (Cloudflare Turnstile) ───────────────────────────────────────
+    # https://www.capsolver.com/ — set to enable Turnstile token solving on login/bid pages.
+    capsolver_api_key: str = Field("", description="CapSolver API key (CAPSOLVER_API_KEY)")
 
     # ── Proxy ─────────────────────────────────────────────────────────────────
     # Use empty string defaults so we can detect "not configured"
@@ -56,6 +57,17 @@ class Settings(BaseSettings):
     dry_run: bool = Field(False, description="If True, evaluate but never bid")
     log_level: str = Field("INFO", description="Logging level")
 
+    # ── Trader profile (evaluator / bids) ─────────────────────────────────────
+    # Use PROFILE_JSON for a one-line JSON object, or leave empty and use PROFILE_PATH file.
+    profile_path: str = Field(
+        "config/profiles/default.json",
+        description="Path to profile JSON when PROFILE_JSON is empty",
+    )
+    profile_json: str = Field(
+        "",
+        description="Optional: full profile as JSON string; overrides profile_path when non-empty",
+    )
+
     @property
     def proxy_server(self) -> str | None:
         """Return formatted proxy URL for Playwright, or None if not configured."""
@@ -77,11 +89,22 @@ class Settings(BaseSettings):
 
 
 def load_profile(profile_path: str = "config/profiles/default.json") -> dict:
-    """Load a carpenter profile from JSON."""
+    """Load a trader profile from a JSON file."""
     path = Path(profile_path)
     if not path.exists():
         raise FileNotFoundError(f"Profile not found: {profile_path}")
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def get_profile() -> dict:
+    """
+    Profile from PROFILE_JSON when set, otherwise from PROFILE_PATH file.
+    Same schema as config/profiles/default.json.
+    """
+    raw = (settings.profile_json or "").strip()
+    if raw:
+        return json.loads(raw)
+    return load_profile(settings.profile_path)
 
 
 # Singleton — import and use anywhere

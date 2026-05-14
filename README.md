@@ -48,7 +48,7 @@ cp .env.example .env
 # - OPENAI_API_KEY
 # - AIRTASKER_EMAIL / AIRTASKER_PASSWORD
 # - TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID
-# - TWOCAPTCHA_API_KEY
+# - CAPSOLVER_API_KEY (Cloudflare Turnstile via https://www.capsolver.com/)
 # - PROXY_HOST / PROXY_PORT / PROXY_USERNAME / PROXY_PASSWORD (optional)
 ```
 
@@ -120,7 +120,8 @@ ai-leads/
 ├── stealth/
 │   ├── browser.py                 # Stealth Chromium factory
 │   ├── behavior.py               # Human mouse/keyboard sim
-│   └── captcha.py                # 2Captcha auto-solver
+│   ├── captcha.py                # Turnstile: CapSolver + browser fallback
+│   └── capsolver_client.py       # CapSolver createTask / getTaskResult
 │
 ├── dashboard/
 │   ├── app.py                    # FastAPI backend
@@ -149,7 +150,7 @@ Expected output: 10 passing tests (no API keys needed — all mocked).
 |---|---|---|
 | OpenAI | [platform.openai.com](https://platform.openai.com) | ~$0.01 per 100 evaluations |
 | Telegram Bot | Message [@BotFather](https://t.me/botfather) | Free |
-| 2Captcha | [2captcha.com](https://2captcha.com) | ~$0.50/1000 solves |
+| CapSolver | [capsolver.com](https://www.capsolver.com/) | Cloudflare Turnstile (~$1.2/1k per [their pricing](https://www.capsolver.com/)) |
 | Residential Proxy | [iproyal.com](https://iproyal.com) | ~$7/GB |
 
 ---

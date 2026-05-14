@@ -204,53 +204,89 @@ _STEALTH_INIT_SCRIPT = """
 })();
 """
 
+# Manual login / visible CAPTCHA: heavy patches (canvas, iframe, WebGL) can prevent
+# Cloudflare Turnstile from rendering. Use this tiny patch only.
+_MIN_STEALTH_INIT_SCRIPT = """
+(function () {
+    'use strict';
+    Object.defineProperty(navigator, 'webdriver', {
+        get: () => undefined,
+        configurable: true,
+    });
+})();
+"""
+
 
 async def make_browser_context(
     playwright: Playwright,
     storage_state: Optional[str] = None,
+    *,
+    headless: bool = True,
+    channel: Optional[str] = None,
+    trust_browser_defaults: bool = False,
+    minimal_stealth: bool = False,
 ) -> tuple[Browser, BrowserContext]:
     """
-    Launch a stealth-patched Chromium browser and create an authenticated context.
+    Launch a stealth-patched browser and create a context.
+
+    For **manual login** on Windows/macOS, use ``channel="chrome"`` and
+    ``trust_browser_defaults=True`` so Playwright drives **installed Google Chrome**
+    with native UA / client hints — Cloudflare Turnstile often fails on bundled
+    Chromium with synthetic ``sec-ch-ua`` headers.
+
+    Set ``minimal_stealth=True`` when the user must **see or solve** Turnstile in the
+    UI: full stealth + playwright-stealth can stop the challenge iframe from loading.
+
     Returns (browser, context).
     """
-    ua = random.choice(_USER_AGENTS)
-    viewport = random.choice(_VIEWPORTS)
     timezone = random.choice(_TIMEZONES)
     locale = "en-AU"
 
-    logger.debug(
-        f"[BROWSER] UA={ua[:40]}... viewport={viewport} tz={timezone}"
-    )
+    if trust_browser_defaults:
+        viewport = {"width": 1440, "height": 900}
+        logger.debug(
+            f"[BROWSER] Using installed browser channel={channel!r} — native UA/client hints; "
+            f"viewport={viewport} tz={timezone}"
+        )
+    else:
+        ua = random.choice(_USER_AGENTS)
+        viewport = random.choice(_VIEWPORTS)
+        logger.debug(
+            f"[BROWSER] UA={ua[:40]}... viewport={viewport} tz={timezone}"
+        )
+
+    launch_args = [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-automation",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-client-side-phishing-detection",
+        "--disable-default-apps",
+        "--disable-hang-monitor",
+        "--disable-popup-blocking",
+        "--disable-prompt-on-repost",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--safebrowsing-disable-auto-update",
+        "--password-store=basic",
+        "--use-mock-keychain",
+        "--window-size=1440,900",
+        "--start-maximized",
+    ]
+    # Full stealth stack disables extensions; keep them for minimal / real-Chrome CAPTCHA UX.
+    if not minimal_stealth:
+        launch_args.insert(5, "--disable-extensions")
 
     launch_kwargs: dict = {
-        "headless": True,
-        "args": [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            # Critical: remove automation flags that Cloudflare detects
-            "--disable-blink-features=AutomationControlled",
-            "--disable-automation",
-            # Performance / stability
-            "--disable-extensions",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-background-networking",
-            "--disable-client-side-phishing-detection",
-            "--disable-default-apps",
-            "--disable-hang-monitor",
-            "--disable-popup-blocking",
-            "--disable-prompt-on-repost",
-            "--disable-sync",
-            "--metrics-recording-only",
-            "--safebrowsing-disable-auto-update",
-            "--password-store=basic",
-            "--use-mock-keychain",
-            # Make headless look more like a real browser
-            "--window-size=1440,900",
-            "--start-maximized",
-        ],
+        "headless": headless,
+        "args": launch_args,
     }
+    if channel:
+        launch_kwargs["channel"] = channel
 
     proxy_cfg = settings.proxy_config
     if proxy_cfg:
@@ -262,7 +298,6 @@ async def make_browser_context(
     browser = await playwright.chromium.launch(**launch_kwargs)
 
     context_kwargs: dict = {
-        "user_agent": ua,
         "viewport": viewport,
         "locale": locale,
         "timezone_id": timezone,
@@ -272,11 +307,20 @@ async def make_browser_context(
         "extra_http_headers": {
             "Accept-Language": "en-AU,en-GB;q=0.9,en;q=0.8",
             "Accept-Encoding": "gzip, deflate, br",
-            "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": '"Windows"',
         },
     }
+    if trust_browser_defaults:
+        # Do not override UA / sec-ch-* — must match real Chrome for Turnstile.
+        pass
+    else:
+        context_kwargs["user_agent"] = ua
+        context_kwargs["extra_http_headers"].update(
+            {
+                "sec-ch-ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Windows"',
+            }
+        )
 
     if storage_state:
         context_kwargs["storage_state"] = storage_state
@@ -284,11 +328,12 @@ async def make_browser_context(
 
     context = await browser.new_context(**context_kwargs)
 
-    # Inject stealth patches into every new page BEFORE any page scripts run
-    await context.add_init_script(_STEALTH_INIT_SCRIPT)
-
-    # Apply playwright-stealth on top (covers additional vectors)
-    context.on("page", lambda page: _apply_stealth(page))
+    if minimal_stealth:
+        await context.add_init_script(_MIN_STEALTH_INIT_SCRIPT)
+        logger.info("[BROWSER] Minimal stealth (webdriver patch only) — Turnstile / CAPTCHA friendly")
+    else:
+        await context.add_init_script(_STEALTH_INIT_SCRIPT)
+        context.on("page", lambda page: _apply_stealth(page))
 
     return browser, context
 

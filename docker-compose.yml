@@ -8,10 +8,14 @@ services:
     env_file: .env
     ports:
       - "8000:8000"
+      - "6080:6080"
     volumes:
       - ./logs:/app/logs
       - ./playwright_storage:/app/.playwright_storage
       - ./config/profiles:/app/config/profiles
+    environment:
+      - DISPLAY=:99
+    shm_size: '2gb'
     depends_on:
       - redis
     networks:

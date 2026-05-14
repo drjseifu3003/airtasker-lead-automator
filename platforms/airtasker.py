@@ -24,6 +24,7 @@ from playwright.async_api import Page, WebSocket, Request, Response
 from agent.models import Job, JobStatus
 from platforms.base import BasePlatform
 from stealth.behavior import human_click, human_type, random_sleep, random_scroll
+from stealth.captcha import solve_captcha_if_present
 
 BASE_URL = "https://www.airtasker.com"
 BROWSE_URL = f"{BASE_URL}/tasks/?state=open"
@@ -67,6 +68,7 @@ class AirtaskerPlatform(BasePlatform):
         ))
 
         await page.goto(BROWSE_URL, wait_until="networkidle", timeout=30_000)
+        await solve_captcha_if_present(page)
         logger.info("[AIRTASKER] Browse page loaded — monitoring for new jobs…")
 
         # Keep the session alive: scroll occasionally, reload every 5 min
@@ -76,6 +78,7 @@ class AirtaskerPlatform(BasePlatform):
             await random_sleep(250, 350)  # ~5 minutes
             logger.debug("[AIRTASKER] Refreshing task feed…")
             await page.reload(wait_until="networkidle", timeout=30_000)
+            await solve_captcha_if_present(page)
 
     async def _on_websocket(self, ws: WebSocket, queue: Queue) -> None:
         """Handle incoming WebSocket messages."""
@@ -191,6 +194,7 @@ class AirtaskerPlatform(BasePlatform):
         logger.info(f"[AIRTASKER] Bidding on {job.id}: {job.title!r} @ ${price}")
         try:
             await page.goto(job.url, wait_until="networkidle", timeout=30_000)
+            await solve_captcha_if_present(page)
             await random_sleep(1.5, 3.0)
             await random_scroll(page)
             await random_sleep(0.5, 1.5)
@@ -226,6 +230,8 @@ class AirtaskerPlatform(BasePlatform):
             )
             await human_type(page, msg_selector, message)
             await random_sleep(1.0, 2.5)
+
+            await solve_captcha_if_present(page)
 
             # Submit
             submit_selector = (

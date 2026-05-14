@@ -10,7 +10,15 @@ from collections import deque
 from datetime import datetime
 from typing import Deque, Dict, List, Optional
 
+from enum import Enum
 from agent.models import Job, JobStatus
+
+
+class SessionStatus(str, Enum):
+    INVALID = "invalid"
+    EXPIRED = "expired"
+    VALID = "valid"
+    LOGGING_IN = "logging_in"
 
 
 class JobStore:
@@ -24,6 +32,7 @@ class JobStore:
         self._order: List[str] = []               # insertion order
         self._logs: Deque[str] = deque(maxlen=self.MAX_LOG_LINES)
         self._started_at: datetime = datetime.utcnow()
+        self._session_status: SessionStatus = SessionStatus.INVALID
 
     # ── Jobs ─────────────────────────────────────────────────────────────────
 
@@ -72,7 +81,18 @@ class JobStore:
             "win_rate": win_rate,
             "est_earnings": est_earnings,
             "uptime_seconds": int((datetime.utcnow() - self._started_at).total_seconds()),
+            "session_status": self._session_status.value,
         }
+
+    # ── Session Status ────────────────────────────────────────────────────────
+
+    async def get_session_status(self) -> SessionStatus:
+        async with self._lock:
+            return self._session_status
+
+    async def set_session_status(self, status: SessionStatus) -> None:
+        async with self._lock:
+            self._session_status = status
 
     # ── Logs ─────────────────────────────────────────────────────────────────
 

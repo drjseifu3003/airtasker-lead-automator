@@ -6,7 +6,7 @@ Responsibilities:
 - Login to Airtasker and persist session state to disk.
   Airtasker uses a TWO-STEP login: email first → Continue → password.
 - Auto-detect session expiry and re-login.
-- Wait for Cloudflare Turnstile to auto-solve in the real browser.
+- Run Cloudflare Turnstile solving (CapSolver + in-browser fallback) when challenges appear.
 - Save a screenshot on any login failure for debugging.
 """
 from __future__ import annotations
@@ -25,6 +25,7 @@ from playwright.async_api import (
 )
 
 from config.settings import settings
+from agent.store import store, SessionStatus
 from stealth.browser import make_browser_context
 from stealth.captcha import solve_captcha_if_present
 
@@ -32,7 +33,6 @@ SESSION_DIR = Path(".playwright_storage")
 SESSION_FILE = SESSION_DIR / "airtasker_session.json"
 SCREENSHOT_DIR = Path("logs")
 
-HOMEPAGE_URL = "https://www.airtasker.com/"
 LOGIN_URL = "https://www.airtasker.com/login/"
 CHECK_URL = "https://www.airtasker.com/dashboard/"
 
@@ -77,13 +77,6 @@ LOGGED_IN_SELECTORS = [
     "a[href*='my-tasks']",
 ]
 
-# BrightData residential proxy takes ~25s per request.
-# All timeouts must be >= 90s to avoid false failures.
-_PAGE_LOAD_TIMEOUT  = 120_000   # 2 min  — full page load via proxy
-_ELEMENT_TIMEOUT    = 90_000    # 90s    — wait for React to render
-_NAV_TIMEOUT        = 120_000   # 2 min  — navigation/URL changes
-_CHECK_TIMEOUT      = 60_000    # 60s    — session check
-
 
 class SessionManager:
     """Manages a persistent, authenticated Playwright browser context."""
@@ -105,21 +98,110 @@ class SessionManager:
         )
         self._page = await self._context.new_page()
 
-        if not await self._is_logged_in():
-            logger.info("[SESSION] Not logged in — authenticating…")
-            await self._login()
+        if SESSION_FILE.exists():
+            if await self._is_logged_in():
+                logger.info("[SESSION] Existing session valid ✓")
+                await store.set_session_status(SessionStatus.VALID)
+            else:
+                logger.warning("[SESSION] Session file exists but is invalid/expired")
+                await store.set_session_status(SessionStatus.EXPIRED)
         else:
-            logger.info("[SESSION] Existing session valid ✓")
+            logger.info("[SESSION] No session file found")
+            await store.set_session_status(SessionStatus.INVALID)
 
         return self._page
 
+    async def manual_login(self) -> bool:
+        """
+        Launch a visible browser for manual login.
+        Waits for the user to reach the dashboard.
+        """
+        await store.set_session_status(SessionStatus.LOGGING_IN)
+        logger.info("[SESSION] Starting manual login (visible browser)...")
+
+        try:
+            pw = await async_playwright().start()
+            try:
+                # Prefer installed Google Chrome — Turnstile often fails on bundled Chromium.
+                browser, context = await make_browser_context(
+                    pw,
+                    storage_state=None,
+                    headless=False,
+                    channel="chrome",
+                    trust_browser_defaults=True,
+                    minimal_stealth=True,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[SESSION] Chrome channel launch failed ({e}); "
+                    "falling back to bundled Chromium (Turnstile may be harder)."
+                )
+                browser, context = await make_browser_context(
+                    pw,
+                    storage_state=None,
+                    headless=False,
+                    channel=None,
+                    trust_browser_defaults=False,
+                    minimal_stealth=True,
+                )
+
+            page = await context.new_page()
+
+            await page.goto(LOGIN_URL)
+            logger.info("[SESSION] Please log in manually in the opened browser window.")
+
+            # Wait for successful login (indicator: reaching dashboard or profile avatar)
+            # We'll poll for the LOGGED_IN_SELECTORS
+            success = False
+            for _ in range(300):  # 5 minute timeout
+                if await page.is_closed():
+                    break
+                
+                # Check for login indicators
+                for sel in LOGGED_IN_SELECTORS:
+                    try:
+                        if await page.locator(sel).first.is_visible(timeout=500):
+                            success = True
+                            break
+                    except:
+                        continue
+                
+                if success:
+                    break
+                await asyncio.sleep(1)
+
+            if success:
+                logger.info("[SESSION] Login detected! Saving session...")
+                await context.storage_state(path=str(SESSION_FILE))
+                await store.set_session_status(SessionStatus.VALID)
+                await asyncio.sleep(2) # Give it a moment
+                return True
+            else:
+                logger.warning("[SESSION] Manual login timed out or browser closed.")
+                await store.set_session_status(SessionStatus.INVALID)
+                return False
+        except Exception as exc:
+            logger.error(f"[SESSION] Manual login error: {exc}")
+            await store.add_log(f"[ERROR] Manual login failed: {exc}")
+            await store.set_session_status(SessionStatus.INVALID)
+            return False
+        finally:
+            if 'browser' in locals() and browser:
+                await browser.close()
+            if 'pw' in locals() and pw:
+                await pw.stop()
+
     async def get_page(self) -> Page:
-        """Return the active page, re-authenticating if needed."""
-        if self._page is None:
+        """Return the active page, ensuring it's logged in."""
+        if self._page is None or self._page.is_closed():
             return await self.start()
+        
+        # Check login status periodically
         if not await self._is_logged_in():
-            logger.warning("[SESSION] Session expired — re-logging in…")
-            await self._login()
+            logger.warning("[SESSION] Session expired")
+            await store.set_session_status(SessionStatus.EXPIRED)
+            # We don't automatically re-login anymore
+        
         return self._page
 
     async def new_tab(self) -> Page:
@@ -166,12 +248,12 @@ class SessionManager:
             for sel in selectors:
                 try:
                     locator = self._page.locator(sel).first
-                    if await locator.is_visible(timeout=500):
+                    if await locator.is_visible(timeout=250):
                         logger.debug(f"[SESSION] Found selector: {sel}")
                         return sel
                 except Exception:
                     continue
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
         return None
 
     async def _click_first_visible(
@@ -201,7 +283,7 @@ class SessionManager:
         while asyncio.get_running_loop().time() < deadline:
             try:
                 button = self._page.locator("button").filter(has_text=re.compile(r"^Continue$", re.I)).first
-                if await button.is_visible(timeout=500) and await button.is_enabled():
+                if await button.is_visible(timeout=250) and await button.is_enabled():
                     try:
                         await button.click(delay=80, timeout=2_500)
                         return True
@@ -210,7 +292,7 @@ class SessionManager:
                         return True
             except Exception:
                 pass
-            await asyncio.sleep(0.3)
+            await asyncio.sleep(0.2)
         return False
 
     async def _safe_click_selector(self, selector: str, timeout: int = 4_000) -> bool:
@@ -228,7 +310,7 @@ class SessionManager:
                 return False
 
     async def _submit_identifier_step(self) -> bool:
-        """Submit the identifier (email) step using multiple strategies."""
+        """Submit the identifier (email) step using multiple non-skipping strategies."""
         try:
             clicked = await self._click_primary_continue(timeout=3_000)
             if clicked:
@@ -286,216 +368,17 @@ class SessionManager:
 
     async def _is_logged_in(self) -> bool:
         try:
-            await self._page.goto(CHECK_URL, wait_until="domcontentloaded", timeout=_CHECK_TIMEOUT)
-            await asyncio.sleep(3)
-            sel = await self._find_selector(LOGGED_IN_SELECTORS, timeout=10_000)
+            await self._page.goto(CHECK_URL, wait_until="domcontentloaded", timeout=20_000)
+            await solve_captcha_if_present(self._page)
+            await asyncio.sleep(2)
+            sel = await self._find_selector(LOGGED_IN_SELECTORS, timeout=5_000)
             return sel is not None
         except Exception:
             return False
 
     async def _login(self) -> None:
-        from stealth.behavior import human_type, random_sleep
-
-        page = self._page
-        logger.info(f"[SESSION] Navigating to {LOGIN_URL}")
-
-        # Step 1: Load the Airtasker homepage (not the login modal directly).
-        # The login page is a Next.js SPA — navigating to /login/ loads the
-        # homepage shell first, then opens a modal. Via proxy this modal may
-        # not render. Instead we: load homepage → click "Log in" → wait for
-        # Auth0 redirect which gives us a fresh state parameter.
-        # The Airtasker "Log in" button has href="#" but onclick triggers a JS
-        # redirect to id.airtasker.com with a fresh ?state= parameter.
-        # Strategy: load homepage → find the Log in anchor by text → JS click it
-        # (bypasses any href="#" interception) → wait for Auth0 URL.
-        logger.info("[SESSION] Loading Airtasker homepage…")
-        await page.goto(HOMEPAGE_URL, wait_until="domcontentloaded", timeout=_PAGE_LOAD_TIMEOUT)
-        await random_sleep(4, 6)
-        await self._screenshot("login_01_page_loaded")
-        logger.info(f"[SESSION] Landed on: {page.url}")
-
-        # Use JS click to ensure the onclick handler fires (not just href navigation)
-        logger.info("[SESSION] JS-clicking Log in button…")
-        clicked = False
-        try:
-            # Find the Log in link by exact text and dispatch a real click event
-            clicked = await page.evaluate("""() => {
-                // Find all anchors/buttons with 'Log in' text
-                const els = [...document.querySelectorAll('a, button')];
-                const btn = els.find(el => el.textContent.trim() === 'Log in');
-                if (btn) {
-                    btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-                    return true;
-                }
-                return false;
-            }""")
-        except Exception as e:
-            logger.warning(f"[SESSION] JS click failed: {e}")
-
-        if clicked:
-            logger.info("[SESSION] JS click fired — waiting for Auth0 redirect…")
-        else:
-            # Fallback: Playwright click
-            logger.info("[SESSION] JS click failed — trying Playwright click…")
-            try:
-                await page.locator("a:has-text('Log in'), button:has-text('Log in')").first.click(timeout=10_000)
-                clicked = True
-            except Exception as e:
-                logger.warning(f"[SESSION] Playwright click also failed: {e}")
-
-        if clicked:
-            try:
-                await page.wait_for_url("**/u/login/**", timeout=_PAGE_LOAD_TIMEOUT)
-                logger.info(f"[SESSION] Auth0 redirect successful: {page.url}")
-            except Exception:
-                logger.warning(f"[SESSION] No Auth0 redirect after click (url={page.url})")
-
-        # If we're still not on Auth0, navigate directly to /login/ as last resort
-        if "id.airtasker.com" not in page.url:
-            logger.info("[SESSION] Navigating directly to /login/ as fallback…")
-            await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=_PAGE_LOAD_TIMEOUT)
-            await random_sleep(2, 3)
-            # One more attempt to click Log in if we got the homepage again
-            if "id.airtasker.com" not in page.url:
-                try:
-                    await page.evaluate("""() => {
-                        const els = [...document.querySelectorAll('a, button')];
-                        const btn = els.find(el => el.textContent.trim() === 'Log in');
-                        if (btn) { btn.click(); return true; }
-                        return false;
-                    }""")
-                    await page.wait_for_url("**/u/login/**", timeout=_PAGE_LOAD_TIMEOUT)
-                    logger.info(f"[SESSION] Auth0 redirect on retry: {page.url}")
-                except Exception:
-                    pass
-
-        await random_sleep(2, 3)
-        await self._screenshot("login_01b_on_auth0")
-        logger.info(f"[SESSION] Current URL before email: {page.url}")
-
-        # ── Step 2: Enter email ────────────────────────────────────────────────
-        # Long timeout — proxy is slow and React may take time to hydrate
-        email_sel = await self._find_selector(EMAIL_SELECTORS, timeout=_ELEMENT_TIMEOUT)
-        if not email_sel:
-            await self._screenshot("login_error_no_email_field")
-            raise RuntimeError(
-                "[SESSION] Could not find email input on Airtasker login page. "
-                "Check logs/login_error_no_email_field.png for a screenshot."
-            )
-
-        logger.info(f"[SESSION] Typing email into: {email_sel}")
-        await human_type(page, email_sel, settings.airtasker_email)
-        await random_sleep(0.5, 1.0)
-
-        # Wait for Airtasker's "Verifying..." spinner to disappear
-        logger.info("[SESSION] Waiting for Airtasker email verification to complete…")
-        try:
-            await page.wait_for_function(
-                "!document.body.innerText.includes('Verifying')",
-                timeout=15_000,
-            )
-        except Exception:
-            pass
-        await asyncio.sleep(2.5)
-        await self._screenshot("login_01b_after_email_verified")
-
-        # Log frames for debugging
-        for i, frame in enumerate(page.frames):
-            logger.debug(f"[SESSION] Frame[{i}]: url={frame.url} name={frame.name}")
-
-        # ── Step 2: Wait for Turnstile to auto-solve in THIS browser ──────────
-        logger.info("[SESSION] Waiting for Turnstile to solve in browser…")
-        turnstile_solved = await solve_captcha_if_present(page)
-        if turnstile_solved:
-            logger.info("[SESSION] Turnstile solved ✓")
-            await random_sleep(0.5, 1.0)
-            await self._screenshot("login_01c_after_checkbox_checked")
-        else:
-            logger.warning(
-                "[SESSION] Turnstile did not auto-solve. Browser may be flagged as bot. "
-                "Add a residential proxy (PROXY_SERVER in .env) to fix this."
-            )
-
-        # ── Step 3: Click Continue ─────────────────────────────────────────────
-        clicked_primary_continue = await self._click_primary_continue(timeout=8_000)
-        if clicked_primary_continue:
-            logger.info("[SESSION] Clicking primary Continue button")
-            await random_sleep(2, 3)
-        else:
-            continue_sel = await self._click_first_visible(SUBMIT_SELECTORS, timeout=5_000)
-            if continue_sel:
-                logger.info(f"[SESSION] Clicking fallback submit button: {continue_sel}")
-                await random_sleep(2, 3)
-            else:
-                logger.info("[SESSION] No Continue button found — pressing Enter")
-                await page.keyboard.press("Enter")
-                await random_sleep(2, 3)
-
-        await self._screenshot("login_02_after_continue")
-
-        # ── Step 4: Navigate to password step ─────────────────────────────────
-        # After Continue, Auth0 does a server round-trip — allow extra time via proxy
-        password_sel = await self._ensure_password_step(timeout=_NAV_TIMEOUT)
-        if not password_sel:
-            logger.warning("[SESSION] Password field not visible after first continue — retrying once")
-            await self._click_primary_continue(timeout=4_000)
-            await random_sleep(1.5, 2.5)
-
-        await solve_captcha_if_present(page)
-
-        password_toggle_sel = await self._click_first_visible(PASSWORD_TOGGLE_SELECTORS, timeout=3_000)
-        if password_toggle_sel:
-            logger.info(f"[SESSION] Opened password login via: {password_toggle_sel}")
-            await random_sleep(2, 3)
-
-        # ── Step 5: Enter password ─────────────────────────────────────────────
-        password_sel = password_sel or await self._ensure_password_step(timeout=_NAV_TIMEOUT)
-        if not password_sel:
-            await self._screenshot("login_error_no_password_field")
-            is_error_page = await self._is_login_error_page()
-            if is_error_page:
-                raise RuntimeError(
-                    "[SESSION] Airtasker showed a login error page. "
-                    "Verify credentials manually and check logs/login_error_no_password_field.png."
-                )
-            logger.error(f"[SESSION] Password field not found. Current URL: {page.url}")
-            raise RuntimeError(
-                "[SESSION] Could not find password input. "
-                "Check logs/login_error_no_password_field.png"
-            )
-
-        logger.info(f"[SESSION] Typing password into: {password_sel}")
-        await human_type(page, password_sel, settings.airtasker_password)
-        await random_sleep(0.5, 1.2)
-
-        # ── Step 6: Submit ─────────────────────────────────────────────────────
-        submit_sel = await self._find_selector(SUBMIT_SELECTORS, timeout=5_000)
-        if submit_sel:
-            logger.info(f"[SESSION] Submitting via: {submit_sel}")
-            clicked = await self._safe_click_selector(submit_sel, timeout=4_000)
-            if not clicked:
-                await page.keyboard.press("Enter")
-        else:
-            await page.keyboard.press("Enter")
-
-        await random_sleep(3, 5)
-        await solve_captcha_if_present(page)
-        await self._screenshot("login_03_post_submit")
-
-        # ── Step 7: Confirm login ──────────────────────────────────────────────
-        logged_in_sel = await self._find_selector(LOGGED_IN_SELECTORS, timeout=_ELEMENT_TIMEOUT)
-        if not logged_in_sel:
-            await self._screenshot("login_error_failed")
-            logger.error(f"[SESSION] Login failed. Current URL: {page.url}")
-            raise RuntimeError(
-                "[SESSION] Airtasker login failed — check credentials, CAPTCHA, or "
-                "inspect logs/login_error_failed.png"
-            )
-
-        logger.info("[SESSION] Login successful ✓")
-        await self._context.storage_state(path=str(SESSION_FILE))
-        logger.info(f"[SESSION] Session saved to {SESSION_FILE}")
-        await random_sleep(1, 2)
+        """Legacy automated login — removed in favour of manual login."""
+        pass
 
 
 # Singleton

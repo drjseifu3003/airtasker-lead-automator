@@ -14,10 +14,9 @@ from agent.evaluator import evaluate
 from agent.models import Job, JobStatus
 from agent.notifier import notifier
 from agent.session import session
-from agent.store import store
+from agent.store import store, SessionStatus
 from agent.bidder import Bidder
-from config.settings import settings
-from config.settings import load_profile
+from config.settings import get_profile, load_profile, settings
 from platforms.airtasker import AirtaskerPlatform
 
 
@@ -28,8 +27,8 @@ class Listener:
       - Worker pool         (consumes Jobs: evaluate → bid → notify)
     """
 
-    def __init__(self, profile_path: str = "config/profiles/default.json") -> None:
-        self._profile = load_profile(profile_path)
+    def __init__(self, profile_path: str | None = None) -> None:
+        self._profile = load_profile(profile_path) if profile_path else get_profile()
         self._platform = AirtaskerPlatform()
         self._queue: Queue[Job] = Queue()
         self._bidder: Bidder | None = None
@@ -40,14 +39,24 @@ class Listener:
         await notifier.send_startup()
 
         # Boot the authenticated browser session
+        first_attempt = True
         while True:
-            try:
-                page = await session.start()
-                break
-            except Exception as exc:
-                logger.error(f"[LISTENER] Session start failed: {exc} — retrying in 20s")
-                await notifier.send_error("Session start failed", str(exc))
-                await asyncio.sleep(20)
+            status = await store.get_session_status()
+            if status == SessionStatus.VALID:
+                try:
+                    page = await session.start()
+                    # Re-confirm if start() also thinks it's valid
+                    if await store.get_session_status() == SessionStatus.VALID:
+                        break
+                except Exception as exc:
+                    logger.error(f"[LISTENER] Session start failed: {exc} — retrying in 20s")
+                    await asyncio.sleep(20)
+            else:
+                if first_attempt:
+                    logger.info("[LISTENER] Waiting for valid Airtasker session... (Log in via dashboard if needed)")
+                    first_attempt = False
+                await asyncio.sleep(5)
+        
         self._bidder = Bidder(session)
 
         # Run listener + workers concurrently
